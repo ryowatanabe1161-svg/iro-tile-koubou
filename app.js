@@ -38,7 +38,8 @@
   function pick(a) { return a[Math.floor(Math.random() * a.length)]; }
   function rand(a) { return a[0] + Math.random() * (a[1] - a[0]); }
   function cleanName(n) { return String(n || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 8); }
-  function genCode() { var c = ''; for (var i = 0; i < 4; i++) c += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]; return c; }
+  var PARTY = window.FuuParty && window.FuuParty.info;   // ひろばの「みんなの部屋」から来たとき
+  function genCode() { if (PARTY && PARTY.host) return PARTY.code; var c = ''; for (var i = 0; i < 4; i++) c += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]; return c; }
   function normCode(c) { return String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/O/g, '0').replace(/I/g, '1').slice(0, 4); }
   function inviteUrl(code) { var u = location.origin + location.pathname + '?room=' + code; if (Q.get('ice')) u += '&ice=' + encodeURIComponent(Q.get('ice')); return u; }
 
@@ -189,7 +190,7 @@
     peer.on('error', function (e) {
       if (e.type === 'unavailable-id') {
         try { peer.destroy(); } catch (x) {}
-        if (!host.opened && R.phase === 'lobby' && !host.resuming) { R.code = genCode(); openHostPeer(); return; }
+        if (!host.opened && R.phase === 'lobby' && !host.resuming && !PARTY) { R.code = genCode(); openHostPeer(); return; }
         if (++host.tries > 25) { connecting(false); toast('部屋を再開できませんでした'); return; }
         connecting(true, '部屋を再開しています…', '少し時間がかかることがあります（' + host.tries + '）');
         setTimeout(openHostPeer, 3000);
@@ -327,10 +328,11 @@
     connecting(true, '部屋 ' + code + ' に接続中…', 'しばらくお待ちください', function () { leaveClient(true); });
     var peer = new Peer(PEER_OPTS);
     client.peer = peer;
+    if (PARTY) client.watch = setInterval(function () { if (!client) return; if (client.everJoined) { clearInterval(client.watch); return; } if (client.peer.open && !(client.conn && client.conn.open)) clientConnect(); }, FuuParty.watchMs);   // みんなの部屋：ホストより先に着いたときの取りこぼし対策
     peer.on('open', function () { clientConnect(); });
     peer.on('disconnected', function () { if (!peer.destroyed) setTimeout(function () { try { peer.reconnect(); } catch (e) {} }, 2000); });
     peer.on('error', function (e) {
-      if (e.type === 'peer-unavailable') { if (!client.everJoined) { connecting(false); toast('部屋が見つかりません。コードを確認してください。'); leaveClient(false); } else clientLost(); }
+      if (e.type === 'peer-unavailable') { if (PARTY && !client.everJoined && (client.ptries = (client.ptries || 0) + 1) < FuuParty.retries) { connecting(true, 'ホストを待っています…', '部屋 ' + client.code); setTimeout(clientConnect, FuuParty.retryMs); return; } if (!client.everJoined) { connecting(false); toast('部屋が見つかりません。コードを確認してください。'); leaveClient(false); } else clientLost(); }
       else if (['network', 'server-error', 'socket-error', 'socket-closed'].indexOf(e.type) >= 0) { if (!client.everJoined) connecting(true, 'サーバーに接続できません', '通信環境を確認してください。再試行しています…'); }
       else if (e.type === 'browser-incompatible') connecting(true, 'このブラウザは対応していません', 'Chrome / Safari の最新版でお試しください');
     });
@@ -351,7 +353,7 @@
     if (!m || typeof m !== 'object') return;
     client.lastMsg = Date.now();
     if (m.t === 'welcome') { client.joined = true; client.everJoined = true; connecting(false); banner(''); sstore(SS_CLIENT, { code: client.code, name: client.name }); }
-    else if (m.t === 'state') { pending = ''; render(m); }
+    else if (m.t === 'fuu-goto') { if (PARTY) { try { sstore(SS_CLIENT, null); } catch (e) {} FuuParty.handle(m); } } else if (m.t === 'state') { pending = ''; render(m); }
     else if (m.t === 'reject') { connecting(false); leaveClient(false); alertBox(m.msg); }
     else if (m.t === 'kicked') { sstore(SS_CLIENT, null); leaveClient(false); alertBox('ホストによって部屋から外されました。'); }
     else if (m.t === 'closed') { sstore(SS_CLIENT, null); leaveClient(false); alertBox('ホストが部屋を閉じました。'); }
@@ -656,4 +658,18 @@
   // テスト・デバッグ用
   window.__iro = { view: null, autoplay: false, ui: ui, act: function (m) { act(m); }, role: function () { return host ? 'host' : client ? 'client' : 'none'; }, hostRoom: function () { return host ? host.room : null; } };
   renderTitle();
+
+  // ---- ひろばの「みんなの部屋」：同じメンバーで自動入室＋ホストは「つぎのゲーム」 ----
+  if (PARTY) {
+    FuuParty.init({ game: 'iro-tile-koubou',
+      isHost: function () { return !!host && !host.room.solo; },
+      inGame: function () { var R = host && host.room; return !!R && ['lobby', 'end', 'over', 'result'].indexOf(R.phase) < 0 && !(R.G && (R.G.over || R.G.phase === 'end' || R.G.phase === 'over')); },
+      broadcast: function (m) { if (host) Object.keys(host.conns).forEach(function (cid) { try { host.conns[cid].send(m); } catch (e) {} }); } });
+    FuuParty.status = function () { return host ? { host: 1, n: Object.keys(host.conns).filter(function (k) { return host.conns[k].open; }).length } : { host: 0, joined: !!(client && client.everJoined) }; };
+    $('nameIn').value = cleanName(PARTY.name) || 'ななし';
+    setTimeout(function () {
+      if (PARTY.host) { store(LS_HOST, null); startHost(cleanName(PARTY.name) || 'ホスト', null); }
+      else startClient(PARTY.code, cleanName(PARTY.name) || 'ななし');
+    }, 50);
+  }
 })();
